@@ -2,7 +2,7 @@
 // @id              osu-tray-profile
 // @name            osu!Profile in Taskbar
 // @description     Displays PP, rank, and avatar from rhythm game osu! (standard mode) next to the system tray
-// @version         3.9
+// @version         3.9.1
 // @author          antoshika
 // @github          https://github.com/Antoshika
 // @include         windhawk.exe
@@ -72,6 +72,7 @@ using namespace Gdiplus;
 std::wstring g_clientId = L"";
 std::wstring g_clientSecret = L"";
 std::wstring g_username = L"";
+std::string g_token = "";
 int g_updateInterval = 300;
 
 std::thread g_uiThread;
@@ -102,6 +103,8 @@ void LoadSettings() {
 
     g_updateInterval = Wh_GetIntSetting(L"update.interval");
     if (g_updateInterval < 5) g_updateInterval = 5;
+
+    g_token = "";
 }
 
 std::string WStringToString(const std::wstring& wstr) {
@@ -141,47 +144,7 @@ void FetchOsuStats() {
     }
 
     HINTERNET hSession = WinHttpOpen(L"Windhawk Osu Mod", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return;
-
-    HINTERNET hConnect = WinHttpConnect(hSession, L"osu.ppy.sh", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return; }
-
-    HINTERNET hRequestAuth = WinHttpOpenRequest(hConnect, L"POST", L"/oauth/token", NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    
-    std::wstring contentType = L"Content-Type: application/x-www-form-urlencoded\r\n";
-    std::wstring postDataW = L"client_id=" + g_clientId + L"&client_secret=" + g_clientSecret + L"&grant_type=client_credentials&scope=public";
-    std::string postData = WStringToString(postDataW);
-
-    BOOL bResults = WinHttpSendRequest(hRequestAuth, contentType.c_str(), (DWORD)-1, (LPVOID)postData.c_str(), (DWORD)postData.length(), (DWORD)postData.length(), 0);
-    
-    std::string token = "";
-    if (bResults && WinHttpReceiveResponse(hRequestAuth, NULL)) {
-        DWORD dwSize = 0;
-        DWORD dwDownloaded = 0;
-        std::string response;
-        do {
-            WinHttpQueryDataAvailable(hRequestAuth, &dwSize);
-            if (dwSize == 0) break;
-            char* pszOutBuffer = new char[dwSize + 1];
-            if (WinHttpReadData(hRequestAuth, (LPVOID)pszOutBuffer, dwSize, &dwDownloaded)) {
-                pszOutBuffer[dwDownloaded] = '\0';
-                response += pszOutBuffer;
-            }
-            delete[] pszOutBuffer;
-        } while (dwSize > 0);
-
-        size_t tokenPos = response.find("\"access_token\":\"");
-        if (tokenPos != std::string::npos) {
-            tokenPos += 16;
-            size_t tokenEnd = response.find("\"", tokenPos);
-            token = response.substr(tokenPos, tokenEnd - tokenPos);
-        }
-    }
-    WinHttpCloseHandle(hRequestAuth);
-
-    if (token.empty()) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+    if (!hSession) {
         AcquireSRWLockExclusive(&g_statsLock);
         g_displayName = L"⛔ error";
         g_displayStats = L"";
@@ -190,12 +153,80 @@ void FetchOsuStats() {
         return;
     }
 
+    HINTERNET hConnect = WinHttpConnect(hSession, L"osu.ppy.sh", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { 
+        WinHttpCloseHandle(hSession); 
+        AcquireSRWLockExclusive(&g_statsLock);
+        g_displayName = L"⛔ error";
+        g_displayStats = L"";
+        g_avatarPath = L"";
+        ReleaseSRWLockExclusive(&g_statsLock);
+        return; 
+    }
+
+    if (g_token.empty()) {
+        HINTERNET hRequestAuth = WinHttpOpenRequest(hConnect, L"POST", L"/oauth/token", NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!hRequestAuth) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            AcquireSRWLockExclusive(&g_statsLock);
+            g_displayName = L"⛔ error";
+            g_displayStats = L"";
+            g_avatarPath = L"";
+            ReleaseSRWLockExclusive(&g_statsLock);
+            return;
+        }
+        
+        std::wstring contentType = L"Content-Type: application/x-www-form-urlencoded\r\n";
+        std::wstring postDataW = L"client_id=" + g_clientId + L"&client_secret=" + g_clientSecret + L"&grant_type=client_credentials&scope=public";
+        std::string postData = WStringToString(postDataW);
+
+        BOOL bResults = WinHttpSendRequest(hRequestAuth, contentType.c_str(), (DWORD)-1, (LPVOID)postData.c_str(), (DWORD)postData.length(), (DWORD)postData.length(), 0);
+        
+        std::string token = "";
+        if (bResults && WinHttpReceiveResponse(hRequestAuth, NULL)) {
+            DWORD dwSize = 0;
+            DWORD dwDownloaded = 0;
+            std::string response;
+            do {
+                WinHttpQueryDataAvailable(hRequestAuth, &dwSize);
+                if (dwSize == 0) break;
+                char* pszOutBuffer = new char[dwSize + 1];
+                if (WinHttpReadData(hRequestAuth, (LPVOID)pszOutBuffer, dwSize, &dwDownloaded)) {
+                    pszOutBuffer[dwDownloaded] = '\0';
+                    response += pszOutBuffer;
+                }
+                delete[] pszOutBuffer;
+            } while (dwSize > 0);
+
+            size_t tokenPos = response.find("\"access_token\":\"");
+            if (tokenPos != std::string::npos) {
+                tokenPos += 16;
+                size_t tokenEnd = response.find("\"", tokenPos);
+                token = response.substr(tokenPos, tokenEnd - tokenPos);
+            }
+        }
+        WinHttpCloseHandle(hRequestAuth);
+
+        if (token.empty()) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            AcquireSRWLockExclusive(&g_statsLock);
+            g_displayName = L"⛔ error";
+            g_displayStats = L"";
+            g_avatarPath = L"";
+            ReleaseSRWLockExclusive(&g_statsLock);
+            return;
+        }
+        g_token = token;
+    }
+
     std::wstring userPath = L"/api/v2/users/" + g_username;
     HINTERNET hRequestUser = WinHttpOpenRequest(hConnect, L"GET", userPath.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     
-    std::wstring authHeader = L"Authorization: Bearer " + StringToWString(token) + L"\r\n";
+    std::wstring authHeader = L"Authorization: Bearer " + StringToWString(g_token) + L"\r\n";
     
-    bResults = WinHttpSendRequest(hRequestUser, authHeader.c_str(), (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    BOOL bResults = WinHttpSendRequest(hRequestUser, authHeader.c_str(), (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
 
     std::string userResponse;
     if (bResults && WinHttpReceiveResponse(hRequestUser, NULL)) {
@@ -216,16 +247,21 @@ void FetchOsuStats() {
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
-    if (userResponse.empty()) return;
+    size_t unPos = userResponse.find("\"username\":\"");
+    if (unPos == std::string::npos) {
+        g_token = "";
+        AcquireSRWLockExclusive(&g_statsLock);
+        g_displayName = L"⛔ error";
+        g_displayStats = L"";
+        g_avatarPath = L"";
+        ReleaseSRWLockExclusive(&g_statsLock);
+        return;
+    }
 
     std::string pp = "0", rank = "0", username = "Unknown", avatarUrl = "";
-    
-    size_t unPos = userResponse.find("\"username\":\"");
-    if (unPos != std::string::npos) {
-        unPos += 12;
-        size_t unEnd = userResponse.find("\"", unPos);
-        username = userResponse.substr(unPos, unEnd - unPos);
-    }
+    unPos += 12;
+    size_t unEnd = userResponse.find("\"", unPos);
+    username = userResponse.substr(unPos, unEnd - unPos);
 
     size_t ppPos = userResponse.find("\"pp\":");
     if (ppPos != std::string::npos) {
@@ -366,7 +402,16 @@ void NetThreadFunc() {
         g_isUpdating = false;
         g_needsRedraw = true;
 
-        for(int i = 0; i < g_updateInterval && g_running; i++) {
+        bool hasError = false;
+        AcquireSRWLockShared(&g_statsLock);
+        if (g_displayName == L"⛔ error" || g_displayName == L"Loading..." || g_displayName == L"✎ check \"Settings\"") {
+            hasError = true;
+        }
+        ReleaseSRWLockShared(&g_statsLock);
+
+        int waitTime = hasError ? 30 : g_updateInterval;
+
+        for(int i = 0; i < waitTime && g_running; i++) {
             if (g_forceUpdate) {
                 g_forceUpdate = false;
                 break;
